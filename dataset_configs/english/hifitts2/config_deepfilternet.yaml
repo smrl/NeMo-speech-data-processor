@@ -1,19 +1,25 @@
 documentation: |
-  HiFiTTS-2 48kHz with DeepFilterNet Trim and Incremental Bucket Copy
-  ####################################################################
+  HiFiTTS-2 48kHz with DeepFilterNet Trim (Bucket-Mounted)
+  ########################################################
   
-  This config can be used to download the audio data for
-  `HiFiTTS-2 <https://huggingface.co/datasets/nvidia/hifitts-2>`_ at 48kHz with:
+  This config downloads and processes HiFiTTS-2 audio data at 48kHz, writing directly to a
+  GCS bucket mounted with gcsfuse to avoid local storage limitations.
   
   1. Downloads HiFiTTS-2 audio from LibriVox at 48kHz.
-  2. Trims silence using DeepFilterNet's energy-based method.
-  3. Copies files incrementally to GCS bucket (chapter-by-chapter) to avoid local storage issues.
-  4. Outputs a new manifest in which LibriVox audiobook chapters which could not be downloaded (e.g. because they
-     were removed from the website) are removed.
+  2. Writes audio files directly to mounted bucket (no local accumulation).
+  3. Trims silence using DeepFilterNet's energy-based method (modifies files on bucket).
+  4. Outputs a new manifest in which LibriVox audiobook chapters which could not be downloaded
+     (e.g. because they were removed from the website) are removed.
 
-  **Required arguments**.
-
-  * **workspace_dir**: specify the workspace folder where all audio files and manifests will be stored.
+  **Required setup**:
+  
+  1. Mount your bucket with gcsfuse:
+     ```bash
+     gcsfuse hifitts-2-dataset ~/NeMo-speech-data-processor/dataset
+     ```
+  
+  2. **workspace_dir**: Local folder for manifests and temporary chapter files.
+  3. **bucket_mount_path**: Path where bucket is mounted (default: ~/NeMo-speech-data-processor/dataset).
 
   Note that you can customize any part of this config either directly or from command-line.
  
@@ -22,11 +28,14 @@ documentation: |
   This config outputs 2 manifest files:
 
   * ``${workspace_dir}/errors.json`` - entries from the input chapters file which failed to download from LibriVox.
-  * ``${workspace_dir}/manifest_filtered_44khz`` - input manifest file without utterances from failed chapters (trimmed, with bucket paths if bucket_path is set).
-  * ``${workspace_dir}/manifest_bucket.json`` - manifest with bucket paths (if bucket_path is set).
+  * ``${workspace_dir}/manifest_filtered_44khz`` - input manifest file without utterances from failed chapters (trimmed).
+  
+  Audio files are written directly to the mounted bucket at ``${bucket_mount_path}/${audio_dir_name}``.
 
 processors_to_run: all
 workspace_dir: ~/NeMo-speech-data-processor/workspace
+# Mount your bucket with: gcsfuse hifitts-2-dataset ~/NeMo-speech-data-processor/dataset
+bucket_mount_path: ~/NeMo-speech-data-processor/dataset
 manifest_filename: manifest_44khz.json
 output_filename: manifest_filtered_44khz.json
 chapter_filename: chapters_44khz.json
@@ -40,13 +49,12 @@ use_dask: false
 max_workers: 4  # Optimized for n2-standard-4 (4 vCPUs)
 chunksize: 50
 
-# Bucket configuration (optional - set to null to disable)
-bucket_path: gs://hifitts-2-dataset/audio_44khz
-
 input_manifest_file: ${workspace_dir}/${manifest_filename}
 chapter_file: ${workspace_dir}/${chapter_filename}
 error_file: ${workspace_dir}/${error_filename}
-audio_dir: ${workspace_dir}/${audio_dir_name}
+# audio_dir points to mounted bucket - files written directly to bucket
+audio_dir: ${bucket_mount_path}/${audio_dir_name}
+# chapter_dir stays local - chapters deleted after processing, minimal storage needed
 chapter_dir: ${workspace_dir}/${chapter_audio_dir_name}
 final_manifest: ${workspace_dir}/${output_filename}
 
@@ -69,6 +77,7 @@ processors:
     error_file: ${error_file}
 
   # Trim silence using DeepFilterNet's energy-based method
+  # Files are on mounted bucket, so trimming happens directly on bucket
   - _target_: sdp.processors.TrimSilence
     input_manifest_file: ${workspace_dir}/manifest_before_trim.json
     output_manifest_file: ${final_manifest}
@@ -79,20 +88,6 @@ processors:
     start_padding_frames: 15    # DeepFilterNet default
     end_padding_frames: 10      # DeepFilterNet default
     update_duration: true
-    use_dask: ${use_dask}
-    max_workers: ${max_workers}
-    chunksize: ${chunksize}
-
-  # Copy to bucket incrementally (chapter-by-chapter) and clean up local files (optional)
-  # This processes chapters one at a time to avoid accumulating all files locally
-  # Set bucket_path: gs://your-bucket/path to enable (set to null to skip)
-  - _target_: sdp.processors.CopyToBucketIncremental
-    input_manifest_file: ${final_manifest}
-    output_manifest_file: ${workspace_dir}/manifest_bucket.json
-    source_audio_dir: ${audio_dir}
-    bucket_path: ${bucket_path}
-    delete_local_files: true
-    update_manifest_paths: true
     use_dask: ${use_dask}
     max_workers: ${max_workers}
     chunksize: ${chunksize}
