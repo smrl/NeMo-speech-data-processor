@@ -170,6 +170,9 @@ from sdp.processors.manage_files.extract import (
 from sdp.processors.manage_files.remove import (
     RemoveFiles,
 )
+from sdp.processors.manage_files.copy_to_bucket_incremental import (
+    CopyToBucketIncremental,
+)
 from sdp.processors.manage_files.convert_to_tarred_audio_dataset import (
     ConvertToTarredAudioDataset,
 )
