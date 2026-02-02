@@ -14,14 +14,8 @@
 
 from sdp.processors.datasets.hifitts2.download_dataset import DownloadHiFiTTS2
 from sdp.processors.datasets.hifitts2.remove_failed_chapters import RemovedFailedChapters
-from sdp.processors.datasets.hifitts2.filter_manifest import (
-    FilterHiFiTTS2Manifest,
-    FilterHiFiTTS2Chapters,
-)
 
 __all__ = [
     "DownloadHiFiTTS2",
     "RemovedFailedChapters",
-    "FilterHiFiTTS2Manifest",
-    "FilterHiFiTTS2Chapters",
 ]
