@@ -15,7 +15,7 @@
 import collections
 import os
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import tempfile
 import shutil
 import requests
@@ -1336,6 +1336,163 @@ class EstimateBandwidth(BaseParallelProcessor):
         bandwidth = self._estimate_bandwidth(audio=audio, sample_rate=sr)
         data_entry[self.output_bandwidth_key] = int(bandwidth)
         return [DataEntry(data=data_entry)]
+
+
+class TrimSilence(BaseParallelProcessor):
+    """
+    Trims leading and trailing silence from audio files using DeepFilterNet's energy-based method.
+    
+    This processor implements the same silence detection algorithm used by DeepFilterNet:
+    - Computes windowed energy in dB
+    - Finds first frame above -120dB (with padding)
+    - Finds last frame above -100dB (with padding)
+    - Trims audio to that range and updates the file
+    
+    Args:
+        audio_dir (str): Root directory where audio files are stored.
+        input_audio_key (str): Manifest key with relative audio paths. Defaults to "audio_filepath".
+        start_threshold_db (float): Energy threshold for detecting start of speech in dB. Defaults to -120.
+        end_threshold_db (float): Energy threshold for detecting end of speech in dB. Defaults to -100.
+        start_padding_frames (int): Number of frames to pad before detected start. Defaults to 15.
+        end_padding_frames (int): Number of frames to pad after detected end. Defaults to 10.
+        min_frames_for_start (int): Minimum frame index before considering start. Defaults to 14.
+        min_frames_for_end (int): Minimum frame index from end before considering end. Defaults to 10.
+        update_duration (bool): Whether to update duration in manifest after trimming. Defaults to True.
+    
+    Returns:
+        Audio files are trimmed in-place and duration is updated in manifest if update_duration is True.
+    
+    Example:
+        .. code-block:: yaml
+        
+            - _target_: sdp.processors.TrimSilence
+              input_manifest_file: ${workspace_dir}/manifest.json
+              output_manifest_file: ${workspace_dir}/manifest_trimmed.json
+              audio_dir: ${workspace_dir}/audio_44khz
+              max_workers: 4
+    """
+    
+    def __init__(
+        self,
+        audio_dir: str,
+        input_audio_key: str = "audio_filepath",
+        start_threshold_db: float = -120.0,
+        end_threshold_db: float = -100.0,
+        start_padding_frames: int = 15,
+        end_padding_frames: int = 10,
+        min_frames_for_start: int = 14,
+        min_frames_for_end: int = 10,
+        update_duration: bool = True,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.audio_directory = Path(audio_dir)
+        self.input_audio_key = input_audio_key
+        self.start_threshold_db = start_threshold_db
+        self.end_threshold_db = end_threshold_db
+        self.start_padding_frames = start_padding_frames
+        self.end_padding_frames = end_padding_frames
+        self.min_frames_for_start = min_frames_for_start
+        self.min_frames_for_end = min_frames_for_end
+        self.update_duration = update_duration
+    
+    def _windowed_energy(self, audio: np.ndarray, window_size: int, hop_size: int) -> np.ndarray:
+        """Compute windowed energy in dB, matching DeepFilterNet's implementation."""
+        # Normalize audio
+        audio = audio.astype(np.float32)
+        max_val = np.abs(audio).max()
+        if max_val > 0:
+            audio = audio / max_val
+        
+        # Pad for windowing
+        pad_size = window_size // 2
+        padded = np.pad(audio, (pad_size, pad_size), mode='constant')
+        
+        # Compute windowed frames
+        n_frames = (len(padded) - window_size) // hop_size + 1
+        frames = np.array([padded[i*hop_size:i*hop_size+window_size] 
+                          for i in range(n_frames)])
+        
+        # Compute energy: power -> log10 -> dB
+        energy = frames ** 2
+        energy = energy + 1e-10  # Avoid log(0)
+        energy = np.log10(energy)
+        energy = np.mean(energy, axis=1) * 20  # Convert to dB
+        
+        return energy
+    
+    def _trim_audio(self, audio: np.ndarray, sample_rate: int) -> Tuple[np.ndarray, bool]:
+        """Trim silence from audio using DeepFilterNet's method."""
+        window_size = sample_rate // 10  # 100ms windows
+        hop_size = sample_rate // 20     # 50ms hop
+        
+        # Compute windowed energy
+        energy = self._windowed_energy(audio, window_size, hop_size)
+        
+        if len(energy) == 0:
+            return audio, False
+        
+        # Find start: first frame above start_threshold_db
+        start_frame = 0
+        for i in range(len(energy)):
+            if energy[i] > self.start_threshold_db and i > self.min_frames_for_start:
+                start_frame = max(0, i - self.start_padding_frames)
+                break
+        
+        # Find end: last frame above end_threshold_db
+        end_frame = len(energy)
+        for i in range(1, len(energy) + 1):
+            if energy[-i] > self.end_threshold_db and i > self.min_frames_for_end:
+                end_frame = min(len(energy), len(energy) - i + self.end_padding_frames)
+                break
+        
+        # Check if trimming is needed
+        if start_frame >= end_frame or end_frame - start_frame >= len(energy):
+            return np.array([]), True  # Everything would be trimmed
+        
+        # Convert frame indices to sample indices
+        start_sample = start_frame * hop_size
+        end_sample = end_frame * hop_size
+        
+        if end_frame < len(energy) - 10:  # Significant trimming occurred
+            trimmed_audio = audio[start_sample:end_sample]
+            return trimmed_audio, True
+        
+        return audio, False
+    
+    def process_dataset_entry(self, data_entry):
+        audio_filename = data_entry[self.input_audio_key]
+        audio_file = self.audio_directory / audio_filename
+        
+        if not audio_file.exists():
+            logger.warning(f"Audio file not found: {audio_file}")
+            return [DataEntry(data=data_entry)]
+        
+        try:
+            # Load audio at native sample rate
+            audio, sr = librosa.load(path=str(audio_file), sr=None)
+            
+            # Trim silence
+            trimmed_audio, was_trimmed = self._trim_audio(audio, sr)
+            
+            if len(trimmed_audio) == 0:
+                logger.warning(f"Audio {audio_file} was completely trimmed, skipping")
+                return []  # Drop this entry
+            
+            if was_trimmed:
+                # Save trimmed audio back to file
+                soundfile.write(file=str(audio_file), data=trimmed_audio, samplerate=int(sr))
+                
+                # Update duration in manifest
+                if self.update_duration:
+                    new_duration = len(trimmed_audio) / sr
+                    data_entry["duration"] = round(new_duration, 3)
+            
+            return [DataEntry(data=data_entry)]
+            
+        except Exception as e:
+            logger.warning(f"Failed to trim silence from {audio_file}: {e}")
+            return [DataEntry(data=data_entry)]
 
 
 class CharacterHistogramLangValidator(BaseParallelProcessor):

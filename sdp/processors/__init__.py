@@ -35,6 +35,10 @@ from sdp.processors.datasets.hifitts2.download_dataset import DownloadHiFiTTS2
 from sdp.processors.datasets.hifitts2.remove_failed_chapters import (
     RemovedFailedChapters,
 )
+from sdp.processors.datasets.hifitts2.filter_manifest import (
+    FilterHiFiTTS2Manifest,
+    FilterHiFiTTS2Chapters,
+)
 from sdp.processors.datasets.ksc2.create_initial_manifest import (
     CreateInitialManifestKSC2,
 )
@@ -119,6 +123,7 @@ from sdp.processors.modify_manifest.data_to_data import (
     ListToEntries,
     LambdaExpression,
     EstimateBandwidth,
+    TrimSilence,
     CharacterHistogramLangValidator,
 )
 from sdp.processors.modify_manifest.data_to_dropbool import (
@@ -153,6 +158,7 @@ from sdp.processors.inference.nlp.fasttext.fasttext import FastTextLangIdClassif
 from sdp.processors.inference.llm.vllm.vllm import vLLMInference
 from sdp.processors.inference.llm.utils.qwen_cleaning import CleanQwenGeneration
 from sdp.processors.inference.quality_estimation.pymarian import CometoidWMTQualityEstimation
+from sdp.processors.quality.squim_utterance import SquimQualityMetrics, DropLowQuality
 
 from sdp.processors.manage_files.convert_audio import (
     FfmpegConvert,
