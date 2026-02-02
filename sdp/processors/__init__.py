@@ -154,7 +154,6 @@ from sdp.processors.inference.nlp.fasttext.fasttext import FastTextLangIdClassif
 from sdp.processors.inference.llm.vllm.vllm import vLLMInference
 from sdp.processors.inference.llm.utils.qwen_cleaning import CleanQwenGeneration
 from sdp.processors.inference.quality_estimation.pymarian import CometoidWMTQualityEstimation
-from sdp.processors.quality.squim_utterance import SquimQualityMetrics, DropLowQuality
 
 from sdp.processors.manage_files.convert_audio import (
     FfmpegConvert,
