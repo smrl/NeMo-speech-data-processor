@@ -26,7 +26,7 @@ documentation: |
   * ``${workspace_dir}/manifest_bucket.json`` - manifest with bucket paths (if bucket_path is set).
 
 processors_to_run: all
-workspace_dir: ???
+workspace_dir: ~/NeMo-speech-data-processor/workspace
 manifest_filename: manifest_44khz.json
 output_filename: manifest_filtered_44khz.json
 chapter_filename: chapters_44khz.json
@@ -41,7 +41,7 @@ max_workers: 4  # Optimized for n2-standard-4 (4 vCPUs)
 chunksize: 50
 
 # Bucket configuration (optional - set to null to disable)
-bucket_path: null  # e.g., gs://my-bucket/hifitts2/audio_44khz
+bucket_path: gs://hifitts-2-dataset/audio_44khz
 
 input_manifest_file: ${workspace_dir}/${manifest_filename}
 chapter_file: ${workspace_dir}/${chapter_filename}
