@@ -32,6 +32,7 @@ import json
 import librosa
 import numpy as np
 from pathlib import Path
+import h5py as h5
 
 from sdp.logging import logger
 from sdp.processors.base_processor import (
@@ -39,7 +40,7 @@ from sdp.processors.base_processor import (
     BaseProcessor,
     DataEntry,
 )
-from sdp.utils.common import ffmpeg_convert
+from sdp.utils.common import ffmpeg_convert, load_manifest, save_manifest
 from sdp.utils.edit_spaces import add_start_end_spaces, remove_extra_spaces
 from sdp.utils.get_diff import get_diff_with_subs_grouped
 from sdp.utils.metrics_computation import get_wer
@@ -1652,3 +1653,315 @@ class CharacterHistogramLangValidator(BaseParallelProcessor):
         # Store the ratio in the data entry
         data_entry[self.output_score_field] = token_ratio
         return [DataEntry(data=data_entry)]
+
+
+class FilterAndSpeakerSplitManifest(BaseProcessor):
+    """
+    Filters entries shorter than ``min_duration`` seconds and assigns a speaker-grouped
+    train / test / val split into the ``set_key`` field.
+
+    Splitting is done at the **speaker** level to avoid leakage: each speaker is
+    assigned to exactly one split. Speakers are shuffled with a fixed seed and
+    greedily assigned to match the desired utterance-level ratios as closely as
+    possible.
+
+    Args:
+        min_duration (float): Minimum duration in seconds to keep an utterance.
+        train_ratio (float): Fraction of utterances to allocate to the train split.
+        test_ratio (float): Fraction of utterances to allocate to the test split.
+        val_ratio (float): Fraction of utterances to allocate to the validation split.
+        speaker_key (str): Manifest key containing speaker ID.
+        set_key (str): Manifest key to write the split label into.
+        seed (int): Random seed for speaker shuffling (for reproducibility).
+
+    Returns:
+        A single manifest written to ``output_manifest_file`` with:
+          - all entries having duration >= ``min_duration``
+          - a ``set_key`` field set to one of ``{\"train\",\"test\",\"val\"}``.
+    """
+
+    def __init__(
+        self,
+        min_duration: float = 3.0,
+        train_ratio: float = 0.75,
+        test_ratio: float = 0.15,
+        val_ratio: float = 0.10,
+        speaker_key: str = "speaker",
+        set_key: str = "set",
+        seed: int = 0,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.min_duration = float(min_duration)
+        self.ratios = {
+            "train": float(train_ratio),
+            "test": float(test_ratio),
+            "val": float(val_ratio),
+        }
+        total = sum(self.ratios.values())
+        if not np.isclose(total, 1.0, atol=1e-6):
+            raise ValueError(f"Split ratios must sum to 1.0, got {total}")
+
+        self.speaker_key = speaker_key
+        self.set_key = set_key
+        self.seed = int(seed)
+
+    def process(self):
+        manifest = load_manifest(self.input_manifest_file)
+        if not manifest:
+            logger.warning("Input manifest is empty; writing empty output.")
+            save_manifest([], self.output_manifest_file)
+            return
+
+        # Filter by duration first
+        filtered = []
+        for entry in manifest:
+            if "duration" not in entry:
+                raise KeyError("Expected 'duration' key in manifest entry but none found.")
+            if entry["duration"] is None:
+                continue
+            try:
+                dur = float(entry["duration"])
+            except Exception as e:
+                raise ValueError(f"Non-numeric duration value {entry['duration']}") from e
+            if dur >= self.min_duration:
+                if self.speaker_key not in entry:
+                    raise KeyError(
+                        f"Expected speaker key '{self.speaker_key}' in manifest entry but none found."
+                    )
+                filtered.append(entry)
+
+        if not filtered:
+            logger.warning(
+                "No entries remaining after duration filtering (min_duration=%.3f).",
+                self.min_duration,
+            )
+            save_manifest([], self.output_manifest_file)
+            return
+
+        # Group by speaker
+        by_speaker: Dict[str, List[dict]] = {}
+        for e in filtered:
+            spk = str(e[self.speaker_key])
+            by_speaker.setdefault(spk, []).append(e)
+
+        speakers = list(by_speaker.keys())
+        rng = np.random.RandomState(self.seed)
+        rng.shuffle(speakers)
+
+        total_utts = sum(len(v) for v in by_speaker.values())
+        targets = {
+            split: self.ratios[split] * total_utts
+            for split in ("train", "test", "val")
+        }
+        counts = {split: 0 for split in ("train", "test", "val")}
+        speaker_to_split: Dict[str, str] = {}
+
+        for spk in speakers:
+            # Greedy assignment to minimize deviation from targets
+            best_split = None
+            best_score = None
+            for split in ("train", "test", "val"):
+                projected = counts[split] + len(by_speaker[spk])
+                # score = |projected - target|
+                score = abs(projected - targets[split])
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_split = split
+            speaker_to_split[spk] = best_split
+            counts[best_split] += len(by_speaker[spk])
+
+        for e in filtered:
+            spk = str(e[self.speaker_key])
+            split = speaker_to_split[spk]
+            e[self.set_key] = split
+
+        logger.info(
+            "FilterAndSpeakerSplitManifest: kept %d entries (out of %d), "
+            "assigned splits (train=%d, test=%d, val=%d)",
+            len(filtered),
+            len(manifest),
+            counts["train"],
+            counts["test"],
+            counts["val"],
+        )
+        save_manifest(filtered, self.output_manifest_file)
+
+
+class ExportPersonalizationArtifacts(BaseProcessor):
+    """
+    Export per-split manifests and DeepFilterNet-style HDF5 + JSON sidecars
+    from a single split-annotated manifest.
+
+    This processor assumes:
+      - Each entry has an audio path in ``audio_key``.
+      - Each entry has a speaker ID in ``speaker_key``.
+      - Each entry has a split label in ``set_key`` (e.g., \"train\", \"test\", \"val\").
+
+    For each requested split, it produces:
+      - ``manifest_<split>.json``: NeMo manifest containing only that split.
+      - ``<hdf5_basename>_<split>.hdf5``: HDF5 with group \"/speech\" and one
+        dataset per utterance (PCM samples), plus ``n_samples`` attribute.
+      - ``<hdf5_basename>_<split>.hdf5.speaker_ids.json``:
+            {\"<hdf5_filename>\": {\"<key>\": \"<speaker_id>\", ...}}
+      - ``<hdf5_basename>_<split>.hdf5.speaker_index.json``:
+            {\"speaker_to_indices\": ..., \"index_to_speaker\": [...], \"total_samples\": N}
+
+    HDF5 keys follow the same convention as in ``REFERENCE/prepare_data.py``:
+        rel_path = os.path.relpath(audio_path, base_audio_dir)
+        key      = rel_path.replace(\"/\", \"_\")
+    """
+
+    def __init__(
+        self,
+        base_audio_dir: str,
+        output_dir: str,
+        audio_key: str = "audio_filepath",
+        speaker_key: str = "speaker",
+        set_key: str = "set",
+        splits: Optional[List[str]] = None,
+        sample_rate: int = 48000,
+        dtype: str = "int16",
+        codec: str = "pcm",
+        hdf5_basename: str = "speech",
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.base_audio_dir = os.path.abspath(base_audio_dir)
+        self.output_dir = os.path.abspath(output_dir)
+        self.audio_key = audio_key
+        self.speaker_key = speaker_key
+        self.set_key = set_key
+        self.splits = splits or ["train", "test", "val"]
+        self.sample_rate = int(sample_rate)
+        self.dtype = dtype
+        self.codec = codec.lower()
+        self.hdf5_basename = hdf5_basename
+
+        if self.codec != "pcm":
+            raise NotImplementedError(
+                f"Only 'pcm' codec is supported in ExportPersonalizationArtifacts, got '{self.codec}'."
+            )
+        if self.dtype not in ("int16", "float32"):
+            raise ValueError("dtype must be 'int16' or 'float32'")
+
+    def _ensure_output_dir(self):
+        os.makedirs(self.output_dir, exist_ok=True)
+
+    def _load_manifest(self) -> List[dict]:
+        with open(self.input_manifest_file, "rt", encoding="utf8") as fin:
+            return [json.loads(line) for line in fin if line.strip()]
+
+    def _audio_to_array(self, path: str) -> np.ndarray:
+        # Load audio; resample to target sample_rate if needed.
+        waveform, sr = torchaudio.load(path)
+        if waveform.dim() == 2 and waveform.shape[0] > 1:
+            waveform = waveform.mean(0, keepdim=True)
+        if sr != self.sample_rate:
+            waveform = torchaudio.functional.resample(
+                waveform, orig_freq=sr, new_freq=self.sample_rate
+            )
+        # (channels, samples) -> (samples,) mono
+        if waveform.dim() == 2:
+            waveform = waveform[0]
+        audio = waveform.numpy()
+        if self.dtype == "int16":
+            # Normalize to [-1,1] if not already, then scale
+            max_val = np.max(np.abs(audio)) or 1.0
+            audio = audio / max_val
+            audio = (audio * 32767.0).astype(np.int16)
+        else:
+            audio = audio.astype(np.float32)
+        return audio
+
+    def _write_split_artifacts(self, split: str, entries: List[dict]):
+        if not entries:
+            logger.warning("No entries for split '%s'; skipping artifact creation.", split)
+            return
+
+        # 1. Per-split manifest
+        manifest_path = os.path.join(self.output_dir, f"manifest_{split}.json")
+        save_manifest(entries, manifest_path)
+
+        # 2. HDF5 audio
+        hdf5_filename = f"{self.hdf5_basename}_{split}.hdf5"
+        hdf5_path = os.path.join(self.output_dir, hdf5_filename)
+        speaker_ids_nested: Dict[str, Dict[str, str]] = {hdf5_filename: {}}
+        index_to_speaker: List[Optional[str]] = []
+        speaker_to_indices: Dict[str, List[int]] = {}
+
+        with h5.File(hdf5_path, "a") as f:
+            if "speech" in f:
+                grp = f["speech"]
+            else:
+                grp = f.create_group("speech")
+
+            f.attrs["sr"] = self.sample_rate
+            f.attrs["dtype"] = self.dtype
+            f.attrs["codec"] = self.codec
+
+            for idx, entry in enumerate(entries):
+                rel_path = entry[self.audio_key]
+                audio_path = os.path.join(self.base_audio_dir, rel_path)
+                if not os.path.isfile(audio_path):
+                    raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+                key = os.path.relpath(audio_path, self.base_audio_dir).replace(os.sep, "_")
+                audio = self._audio_to_array(audio_path)
+
+                if key in grp:
+                    del grp[key]
+                ds = grp.create_dataset(key, data=audio, compression=None)
+                ds.attrs["n_samples"] = int(audio.shape[0])
+
+                speaker = str(entry[self.speaker_key])
+                speaker_ids_nested[hdf5_filename][key] = speaker
+                index_to_speaker.append(speaker)
+                speaker_to_indices.setdefault(speaker, []).append(idx)
+
+        sidecar_ids_path = hdf5_path + ".speaker_ids.json"
+        with open(sidecar_ids_path, "w", encoding="utf8") as fout:
+            json.dump(speaker_ids_nested, fout, indent=2)
+
+        sidecar_index = {
+            "speaker_to_indices": speaker_to_indices,
+            "index_to_speaker": index_to_speaker,
+            "total_samples": len(index_to_speaker),
+        }
+        sidecar_index_path = hdf5_path + ".speaker_index.json"
+        with open(sidecar_index_path, "w", encoding="utf8") as fout:
+            json.dump(sidecar_index, fout, indent=2)
+
+        logger.info(
+            "Exported split '%s': %d entries -> %s, %s, %s",
+            split,
+            len(entries),
+            manifest_path,
+            sidecar_ids_path,
+            sidecar_index_path,
+        )
+
+    def process(self):
+        self._ensure_output_dir()
+        manifest = self._load_manifest()
+        if not manifest:
+            logger.warning("ExportPersonalizationArtifacts received an empty manifest; nothing to export.")
+            return
+
+        by_split: Dict[str, List[dict]] = {s: [] for s in self.splits}
+        for entry in manifest:
+            split = entry.get(self.set_key)
+            if split not in by_split:
+                # Ignore entries with unknown splits
+                continue
+            by_split[split].append(entry)
+
+        for split in self.splits:
+            self._write_split_artifacts(split, by_split[split])
+
+        # For compatibility with BaseProcessor, set output_manifest_file to the train manifest if it exists
+        train_manifest = os.path.join(self.output_dir, "manifest_train.json")
+        if os.path.exists(train_manifest):
+            # overwrite primary output with the train manifest path if user pointed elsewhere
+            if self.output_manifest_file and self.output_manifest_file != train_manifest:
+                shutil.copy(train_manifest, self.output_manifest_file)

@@ -104,6 +104,7 @@ from sdp.processors.modify_manifest.data_to_data import (
     CopyManifestData,
     CountNumWords,
     ExtractFromBrackets,
+    FilterAndSpeakerSplitManifest,
     GetAudioDuration,
     GetWER,
     InsIfASRInsertion,
@@ -121,6 +122,7 @@ from sdp.processors.modify_manifest.data_to_data import (
     EstimateBandwidth,
     TrimSilence,
     CharacterHistogramLangValidator,
+    ExportPersonalizationArtifacts,
 )
 from sdp.processors.modify_manifest.data_to_dropbool import (
     DropASRError,

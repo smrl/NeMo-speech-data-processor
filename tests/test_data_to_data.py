@@ -25,6 +25,7 @@ from sdp.processors.modify_manifest.data_to_data import (
     ListToEntries,
     LambdaExpression,
     CharacterHistogramLangValidator,
+    FilterAndSpeakerSplitManifest,
 )
 
 from sdp.processors.inference.llm.utils.qwen_cleaning import CleanQwenGeneration
@@ -357,3 +358,67 @@ def test_data_to_data(test_class, class_kwargs, test_input, expected_output):
     result = [entry.data for entry in processor.process_dataset_entry(test_input)]
 
     assert result == expected_output
+
+
+def test_filter_and_speaker_split_manifest_basic(tmp_path):
+    # Create a small manifest with multiple speakers and mixed durations
+    manifest_path = tmp_path / "input_manifest.json"
+    entries = [
+        {"audio_filepath": "a.wav", "speaker": "spk1", "duration": 2.5},  # will be dropped (short)
+        {"audio_filepath": "b.wav", "speaker": "spk1", "duration": 4.0},
+        {"audio_filepath": "c.wav", "speaker": "spk2", "duration": 5.0},
+        {"audio_filepath": "d.wav", "speaker": "spk2", "duration": 6.0},
+        {"audio_filepath": "e.wav", "speaker": "spk3", "duration": 7.0},
+    ]
+    with open(manifest_path, "w", encoding="utf8") as f:
+        for e in entries:
+            f.write(f"{__import__('json').dumps(e)}\n")
+
+    output_path = tmp_path / "output_manifest.json"
+    processor = FilterAndSpeakerSplitManifest(
+        input_manifest_file=str(manifest_path),
+        output_manifest_file=str(output_path),
+        min_duration=3.0,
+        train_ratio=0.5,
+        test_ratio=0.25,
+        val_ratio=0.25,
+        seed=42,
+    )
+    processor.process()
+
+    # Read back and check invariants
+    with open(output_path, "r", encoding="utf8") as f:
+        out_entries = [__import__("json").loads(line) for line in f]
+
+    # All remaining entries must have duration >= 3.0
+    assert all(e["duration"] >= 3.0 for e in out_entries)
+
+    # Speakers should not span multiple splits
+    speakers_per_split = {}
+    for e in out_entries:
+        speakers_per_split.setdefault(e["set"], set()).add(e["speaker"])
+
+    # Ensure each speaker appears in only one split
+    speaker_to_split = {}
+    for split, spks in speakers_per_split.items():
+        for spk in spks:
+            if spk in speaker_to_split:
+                pytest.fail(f"Speaker {spk} appears in multiple splits")
+            speaker_to_split[spk] = split
+
+    # Determinism: running again with the same seed should produce the same assignments
+    output_path_2 = tmp_path / "output_manifest_2.json"
+    processor2 = FilterAndSpeakerSplitManifest(
+        input_manifest_file=str(manifest_path),
+        output_manifest_file=str(output_path_2),
+        min_duration=3.0,
+        train_ratio=0.5,
+        test_ratio=0.25,
+        val_ratio=0.25,
+        seed=42,
+    )
+    processor2.process()
+    with open(output_path_2, "r", encoding="utf8") as f:
+        out_entries2 = [__import__("json").loads(line) for line in f]
+
+    assert out_entries2 == out_entries
