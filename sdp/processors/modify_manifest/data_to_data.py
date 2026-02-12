@@ -1746,8 +1746,20 @@ class FilterAndSpeakerSplitManifest(BaseProcessor):
             by_speaker.setdefault(spk, []).append(e)
 
         speakers = list(by_speaker.keys())
+        # Sort by size (largest first) to assign large speakers to large splits first
+        speakers.sort(key=lambda spk: len(by_speaker[spk]), reverse=True)
         rng = np.random.RandomState(self.seed)
-        rng.shuffle(speakers)
+        # Shuffle speakers of the same size to maintain some randomness
+        # Group by size, shuffle within groups, then flatten
+        from collections import defaultdict
+        by_size = defaultdict(list)
+        for spk in speakers:
+            by_size[len(by_speaker[spk])].append(spk)
+        speakers = []
+        for size in sorted(by_size.keys(), reverse=True):
+            same_size = by_size[size]
+            rng.shuffle(same_size)
+            speakers.extend(same_size)
 
         total_utts = sum(len(v) for v in by_speaker.values())
         targets = {
@@ -1758,18 +1770,29 @@ class FilterAndSpeakerSplitManifest(BaseProcessor):
         speaker_to_split: Dict[str, str] = {}
 
         for spk in speakers:
-            # Greedy assignment to minimize deviation from targets
+            # Greedy assignment using relative deviation to handle skewed sizes
             best_split = None
             best_score = None
+            spk_size = len(by_speaker[spk])
             for split in ("train", "test", "val"):
-                projected = counts[split] + len(by_speaker[spk])
-                # score = |projected - target|
-                score = abs(projected - targets[split])
+                if self.ratios[split] == 0:
+                    continue  # Skip splits with zero ratio
+                projected = counts[split] + spk_size
+                # Use relative deviation: |projected - target| / (target + 1) to avoid division by zero
+                # This ensures splits with larger targets (higher ratios) are prioritized
+                target = targets[split]
+                if target > 0:
+                    score = abs(projected - target) / (target + 1)
+                else:
+                    score = float('inf')
                 if best_score is None or score < best_score:
                     best_score = score
                     best_split = split
+            # Fallback: if somehow no split was chosen, assign to train
+            if best_split is None:
+                best_split = "train"
             speaker_to_split[spk] = best_split
-            counts[best_split] += len(by_speaker[spk])
+            counts[best_split] += spk_size
 
         for e in filtered:
             spk = str(e[self.speaker_key])
