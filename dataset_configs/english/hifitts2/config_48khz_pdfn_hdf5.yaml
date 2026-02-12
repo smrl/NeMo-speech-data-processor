@@ -1,0 +1,107 @@
+documentation: |
+  HiFiTTS-2 48kHz → DeepFilterNet Personalization Artifacts
+  #########################################################
+
+  This config takes an already-filtered HiFiTTS-2 manifest and:
+
+    1. Drops utterances shorter than 3 seconds.
+    2. Performs a speaker-grouped 75/15/10 train/test/val split.
+    3. Exports per-split manifests and DeepFilterNet-style HDF5 + JSON sidecars.
+
+  Assumptions:
+    - The filtered manifest is in standard NeMo JSONL format, with at least:
+        * audio_filepath (relative to an audio root)
+        * duration (seconds)
+        * speaker
+    - Audio files live under a separate root (e.g., a bucket-mounted directory).
+
+  Outputs:
+    - ${hdf5_output_dir}/manifest_train.json
+    - ${hdf5_output_dir}/manifest_test.json
+    - ${hdf5_output_dir}/manifest_val.json
+    - ${hdf5_output_dir}/hifitts2_speech_train.hdf5 (+ speaker_ids/speaker_index sidecars)
+    - ${hdf5_output_dir}/hifitts2_speech_test.hdf5  (+ sidecars)
+    - ${hdf5_output_dir}/hifitts2_speech_val.hdf5   (+ sidecars)
+
+processors_to_run: all
+
+###############################################################################
+# User-adjustable paths
+###############################################################################
+
+workspace_dir: /home/user/NeMo-speech-data-processor/workspace
+
+# Existing filtered manifest (JSONL, one entry per line)
+filtered_manifest: ${workspace_dir}/manifest_filtered_48khz.json
+
+# Root directory where audio files actually live.
+# audio_filepath in the manifest should be relative to this directory.
+audio_source_dir: /home/user/NeMo-speech-data-processor/dataset/audio_48khz
+
+# Where HDF5 + JSON artifacts will be written
+hdf5_output_dir: ${workspace_dir}/dfn_personalization
+
+###############################################################################
+# Split & audio parameters
+###############################################################################
+
+sample_rate: 48000
+min_duration: 3.0
+
+train_ratio: 0.75
+test_ratio: 0.15
+val_ratio: 0.10
+
+speaker_key: speaker
+set_key: set
+seed: 0
+
+###############################################################################
+# Derived paths
+###############################################################################
+
+split_manifest: ${workspace_dir}/manifest_split_personalization.json
+
+###############################################################################
+# Pipeline
+###############################################################################
+
+processors:
+  # 1) Duration filtering and speaker-grouped 75/15/10 split
+  - _target_: sdp.processors.FilterAndSpeakerSplitManifest
+    input_manifest_file: ${filtered_manifest}
+    output_manifest_file: ${split_manifest}
+
+    min_duration: ${min_duration}
+    train_ratio: ${train_ratio}
+    test_ratio: ${test_ratio}
+    val_ratio: ${val_ratio}
+
+    speaker_key: ${speaker_key}
+    set_key: ${set_key}
+    seed: ${seed}
+
+  # 2) Export per-split manifests + HDF5 + speaker sidecars
+  - _target_: sdp.processors.ExportPersonalizationArtifacts
+    input_manifest_file: ${split_manifest}
+
+    # Convenience: this will be a copy of manifest_train.json
+    output_manifest_file: ${workspace_dir}/manifest_train_personalization.json
+
+    base_audio_dir: ${audio_source_dir}
+    output_dir: ${hdf5_output_dir}
+
+    audio_key: audio_filepath
+    speaker_key: ${speaker_key}
+    set_key: ${set_key}
+
+    sample_rate: ${sample_rate}
+    dtype: int16
+    codec: pcm
+    hdf5_basename: hifitts2_speech
+
+    splits:
+      - train
+      - test
+      - val
+
