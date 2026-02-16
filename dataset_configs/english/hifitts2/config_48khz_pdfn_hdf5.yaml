@@ -57,6 +57,8 @@ speaker_key: speaker
 set_key: set
 seed: 0
 max_workers: 16
+resume_if_exists: true
+preprocess_batch_size: 512
 
 ###############################################################################
 # Derived paths
@@ -99,6 +101,8 @@ processors:
 
     sample_rate: ${sample_rate}
     max_workers: ${max_workers}
+    resume_if_exists: ${resume_if_exists}
+    preprocess_batch_size: ${preprocess_batch_size}
     dtype: int16
     codec: pcm
     hdf5_basename: hifitts2_speech

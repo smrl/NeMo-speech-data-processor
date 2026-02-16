@@ -17,6 +17,7 @@ import os
 import re
 from array import array
 from concurrent.futures import ThreadPoolExecutor
+from collections import deque
 from typing import Dict, List, Optional, Tuple
 import tempfile
 import shutil
@@ -1850,6 +1851,8 @@ class ExportPersonalizationArtifacts(BaseProcessor):
         codec: str = "pcm",
         hdf5_basename: str = "speech",
         max_workers: int = -1,
+        resume_if_exists: bool = False,
+        preprocess_batch_size: int = 512,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -1863,6 +1866,8 @@ class ExportPersonalizationArtifacts(BaseProcessor):
         self.dtype = dtype
         self.codec = codec.lower()
         self.hdf5_basename = hdf5_basename
+        self.resume_if_exists = bool(resume_if_exists)
+        self.preprocess_batch_size = max(1, int(preprocess_batch_size))
         if max_workers == -1:
             max_workers = os.cpu_count() or 1
         self.max_workers = max(1, int(max_workers))
@@ -1874,28 +1879,28 @@ class ExportPersonalizationArtifacts(BaseProcessor):
         if self.dtype not in ("int16", "float32"):
             raise ValueError("dtype must be 'int16' or 'float32'")
 
-    def _prepare_entry_for_hdf5(self, indexed_entry: Tuple[int, dict]) -> Tuple[int, str, np.ndarray, str]:
-        idx, entry = indexed_entry
+    def _entry_to_key_and_speaker(self, entry: dict) -> Tuple[str, str, str]:
         rel_path = entry[self.audio_key]
         audio_path = os.path.join(self.base_audio_dir, rel_path)
+        key = os.path.relpath(audio_path, self.base_audio_dir).replace(os.sep, "_")
+        speaker = str(entry[self.speaker_key])
+        return audio_path, key, speaker
+
+    def _prepare_entry_for_hdf5(self, entry: dict) -> Tuple[str, np.ndarray, str]:
+        audio_path, key, speaker = self._entry_to_key_and_speaker(entry)
         if not os.path.isfile(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
-
-        key = os.path.relpath(audio_path, self.base_audio_dir).replace(os.sep, "_")
         audio = self._audio_to_array(audio_path)
-        speaker = str(entry[self.speaker_key])
-        return idx, key, audio, speaker
+        return key, audio, speaker
 
-    def _iter_prepared_entries(self, entries: List[dict], start_idx: int = 0):
-        indexed_entries = enumerate(entries, start=start_idx)
+    def _iter_prepared_entries(self, entries: List[dict]):
         if self.max_workers == 1:
-            for indexed_entry in indexed_entries:
-                yield self._prepare_entry_for_hdf5(indexed_entry)
+            for entry in entries:
+                yield self._prepare_entry_for_hdf5(entry)
             return
 
-        # Parallelize I/O + resampling while keeping writes to HDF5 single-threaded.
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            for prepared in executor.map(self._prepare_entry_for_hdf5, indexed_entries):
+            for prepared in executor.map(self._prepare_entry_for_hdf5, entries):
                 yield prepared
 
     def _ensure_output_dir(self):
@@ -1907,7 +1912,7 @@ class ExportPersonalizationArtifacts(BaseProcessor):
                 if line.strip():
                     yield json.loads(line)
 
-    def _iter_manifest_batches(self, manifest_path: str, batch_size: int = 512):
+    def _iter_manifest_batches(self, manifest_path: str, batch_size: int):
         batch = []
         for entry in self._iter_manifest_entries(manifest_path):
             batch.append(entry)
@@ -1965,18 +1970,43 @@ class ExportPersonalizationArtifacts(BaseProcessor):
                 ids_out.write(":{")
                 first_pair = True
 
-                # Always recreate per-split artifacts to avoid appending to partial/corrupted files from prior failed runs.
-                with h5.File(hdf5_path, "w") as f:
-                    grp = f.create_group("speech")
+                hdf5_mode = "a" if self.resume_if_exists and os.path.exists(hdf5_path) else "w"
+                with h5.File(hdf5_path, hdf5_mode) as f:
+                    if "speech" in f:
+                        grp = f["speech"]
+                    else:
+                        grp = f.create_group("speech")
                     f.attrs["sr"] = self.sample_rate
                     f.attrs["dtype"] = self.dtype
                     f.attrs["codec"] = self.codec
 
-                    processed = 0
-                    for batch in self._iter_manifest_batches(manifest_path):
-                        for idx, key, audio, speaker in self._iter_prepared_entries(batch, start_idx=processed):
-                            ds = grp.create_dataset(key, data=audio, compression=None)
-                            ds.attrs["n_samples"] = int(audio.shape[0])
+                    output_index = 0
+                    written_count = 0
+                    reused_count = 0
+                    for batch in self._iter_manifest_batches(manifest_path, batch_size=self.preprocess_batch_size):
+                        batch_meta = []
+                        entries_to_prepare = []
+                        for entry in batch:
+                            _, key, speaker = self._entry_to_key_and_speaker(entry)
+                            exists_in_hdf5 = key in grp
+                            batch_meta.append((key, speaker, exists_in_hdf5))
+                            if not exists_in_hdf5:
+                                entries_to_prepare.append(entry)
+
+                        prepared_iter = iter(self._iter_prepared_entries(entries_to_prepare))
+                        for key, speaker, exists_in_hdf5 in batch_meta:
+                            if exists_in_hdf5:
+                                reused_count += 1
+                            else:
+                                prepared_key, audio, prepared_speaker = next(prepared_iter)
+                                if prepared_key != key:
+                                    raise RuntimeError(
+                                        f"Prepared key mismatch: expected {key}, got {prepared_key}"
+                                    )
+                                ds = grp.create_dataset(prepared_key, data=audio, compression=None)
+                                ds.attrs["n_samples"] = int(audio.shape[0])
+                                speaker = prepared_speaker
+                                written_count += 1
 
                             if not first_pair:
                                 ids_out.write(",")
@@ -1987,8 +2017,8 @@ class ExportPersonalizationArtifacts(BaseProcessor):
 
                             tmp_idx_to_speaker.write(speaker)
                             tmp_idx_to_speaker.write("\n")
-                            speaker_to_indices.setdefault(speaker, array("I")).append(idx)
-                        processed += len(batch)
+                            speaker_to_indices.setdefault(speaker, array("I")).append(output_index)
+                            output_index += 1
 
                 ids_out.write("}}")
 
@@ -2029,9 +2059,12 @@ class ExportPersonalizationArtifacts(BaseProcessor):
                 os.remove(index_to_speaker_tmp_path)
 
         logger.info(
-            "Exported split '%s': %d entries -> %s, %s, %s",
+            "Exported split '%s': %d entries (written=%d, reused=%d, resume=%s) -> %s, %s, %s",
             split,
             num_entries,
+            written_count,
+            reused_count,
+            self.resume_if_exists,
             manifest_path,
             sidecar_ids_path,
             sidecar_index_path,
