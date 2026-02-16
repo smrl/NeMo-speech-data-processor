@@ -1952,10 +1952,11 @@ class ExportPersonalizationArtifacts(BaseProcessor):
         speaker_to_indices: Dict[str, array] = {}
 
         # Keep this stream on disk to avoid storing a potentially huge list of speakers in RAM.
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf8", delete=False, prefix=f"{split}_index_to_speaker_", suffix=".tmp"
-        ) as tmp_idx_to_speaker:
-            index_to_speaker_tmp_path = tmp_idx_to_speaker.name
+        tmp_fd, index_to_speaker_tmp_path = tempfile.mkstemp(
+            prefix=f"{split}_index_to_speaker_", suffix=".tmp"
+        )
+        os.close(tmp_fd)
+        tmp_idx_to_speaker = open(index_to_speaker_tmp_path, "w", encoding="utf8")
 
         try:
             with open(sidecar_ids_path, "w", encoding="utf8") as ids_out:
@@ -2023,6 +2024,7 @@ class ExportPersonalizationArtifacts(BaseProcessor):
                 fout.write(f"\"total_samples\":{total_samples}")
                 fout.write("}")
         finally:
+            tmp_idx_to_speaker.close()
             if os.path.exists(index_to_speaker_tmp_path):
                 os.remove(index_to_speaker_tmp_path)
 
