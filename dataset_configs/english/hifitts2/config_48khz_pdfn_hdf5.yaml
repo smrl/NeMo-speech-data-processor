@@ -24,6 +24,7 @@ documentation: |
     - ${hdf5_output_dir}/hifitts2_speech_val.hdf5   (+ sidecars)
 
 processors_to_run: all
+use_dask: false
 
 ###############################################################################
 # User-adjustable paths

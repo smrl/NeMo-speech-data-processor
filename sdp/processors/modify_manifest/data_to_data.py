@@ -15,6 +15,7 @@
 import collections
 import os
 import re
+from array import array
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple
 import tempfile
@@ -1885,8 +1886,8 @@ class ExportPersonalizationArtifacts(BaseProcessor):
         speaker = str(entry[self.speaker_key])
         return idx, key, audio, speaker
 
-    def _iter_prepared_entries(self, entries: List[dict]):
-        indexed_entries = enumerate(entries)
+    def _iter_prepared_entries(self, entries: List[dict], start_idx: int = 0):
+        indexed_entries = enumerate(entries, start=start_idx)
         if self.max_workers == 1:
             for indexed_entry in indexed_entries:
                 yield self._prepare_entry_for_hdf5(indexed_entry)
@@ -1900,9 +1901,21 @@ class ExportPersonalizationArtifacts(BaseProcessor):
     def _ensure_output_dir(self):
         os.makedirs(self.output_dir, exist_ok=True)
 
-    def _load_manifest(self) -> List[dict]:
-        with open(self.input_manifest_file, "rt", encoding="utf8") as fin:
-            return [json.loads(line) for line in fin if line.strip()]
+    def _iter_manifest_entries(self, manifest_path: str):
+        with open(manifest_path, "rt", encoding="utf8") as fin:
+            for line in fin:
+                if line.strip():
+                    yield json.loads(line)
+
+    def _iter_manifest_batches(self, manifest_path: str, batch_size: int = 512):
+        batch = []
+        for entry in self._iter_manifest_entries(manifest_path):
+            batch.append(entry)
+            if len(batch) >= batch_size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
 
     def _audio_to_array(self, path: str) -> np.ndarray:
         # Load audio; resample to target sample_rate if needed.
@@ -1926,59 +1939,97 @@ class ExportPersonalizationArtifacts(BaseProcessor):
             audio = audio.astype(np.float32)
         return audio
 
-    def _write_split_artifacts(self, split: str, entries: List[dict]):
-        if not entries:
+    def _write_split_artifacts(self, split: str, manifest_path: str, num_entries: int):
+        if num_entries == 0:
             logger.warning("No entries for split '%s'; skipping artifact creation.", split)
             return
 
-        # 1. Per-split manifest
-        manifest_path = os.path.join(self.output_dir, f"manifest_{split}.json")
-        save_manifest(entries, manifest_path)
-
-        # 2. HDF5 audio
+        # HDF5 audio
         hdf5_filename = f"{self.hdf5_basename}_{split}.hdf5"
         hdf5_path = os.path.join(self.output_dir, hdf5_filename)
-        speaker_ids_nested: Dict[str, Dict[str, str]] = {hdf5_filename: {}}
-        index_to_speaker: List[Optional[str]] = []
-        speaker_to_indices: Dict[str, List[int]] = {}
-
-        with h5.File(hdf5_path, "a") as f:
-            if "speech" in f:
-                grp = f["speech"]
-            else:
-                grp = f.create_group("speech")
-
-            f.attrs["sr"] = self.sample_rate
-            f.attrs["dtype"] = self.dtype
-            f.attrs["codec"] = self.codec
-
-            for idx, key, audio, speaker in self._iter_prepared_entries(entries):
-                if key in grp:
-                    del grp[key]
-                ds = grp.create_dataset(key, data=audio, compression=None)
-                ds.attrs["n_samples"] = int(audio.shape[0])
-
-                speaker_ids_nested[hdf5_filename][key] = speaker
-                index_to_speaker.append(speaker)
-                speaker_to_indices.setdefault(speaker, []).append(idx)
-
         sidecar_ids_path = hdf5_path + ".speaker_ids.json"
-        with open(sidecar_ids_path, "w", encoding="utf8") as fout:
-            json.dump(speaker_ids_nested, fout, indent=2)
-
-        sidecar_index = {
-            "speaker_to_indices": speaker_to_indices,
-            "index_to_speaker": index_to_speaker,
-            "total_samples": len(index_to_speaker),
-        }
         sidecar_index_path = hdf5_path + ".speaker_index.json"
-        with open(sidecar_index_path, "w", encoding="utf8") as fout:
-            json.dump(sidecar_index, fout, indent=2)
+        speaker_to_indices: Dict[str, array] = {}
+
+        # Keep this stream on disk to avoid storing a potentially huge list of speakers in RAM.
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf8", delete=False, prefix=f"{split}_index_to_speaker_", suffix=".tmp"
+        ) as tmp_idx_to_speaker:
+            index_to_speaker_tmp_path = tmp_idx_to_speaker.name
+
+        try:
+            with open(sidecar_ids_path, "w", encoding="utf8") as ids_out:
+                ids_out.write("{")
+                ids_out.write(json.dumps(hdf5_filename))
+                ids_out.write(":{")
+                first_pair = True
+
+                # Always recreate per-split artifacts to avoid appending to partial/corrupted files from prior failed runs.
+                with h5.File(hdf5_path, "w") as f:
+                    grp = f.create_group("speech")
+                    f.attrs["sr"] = self.sample_rate
+                    f.attrs["dtype"] = self.dtype
+                    f.attrs["codec"] = self.codec
+
+                    processed = 0
+                    for batch in self._iter_manifest_batches(manifest_path):
+                        for idx, key, audio, speaker in self._iter_prepared_entries(batch, start_idx=processed):
+                            ds = grp.create_dataset(key, data=audio, compression=None)
+                            ds.attrs["n_samples"] = int(audio.shape[0])
+
+                            if not first_pair:
+                                ids_out.write(",")
+                            first_pair = False
+                            ids_out.write(json.dumps(key))
+                            ids_out.write(":")
+                            ids_out.write(json.dumps(speaker))
+
+                            tmp_idx_to_speaker.write(speaker)
+                            tmp_idx_to_speaker.write("\n")
+                            speaker_to_indices.setdefault(speaker, array("I")).append(idx)
+                        processed += len(batch)
+
+                ids_out.write("}}")
+
+            with open(sidecar_index_path, "w", encoding="utf8") as fout:
+                fout.write("{")
+                fout.write("\"speaker_to_indices\":{")
+                first_speaker = True
+                for speaker, idxs in speaker_to_indices.items():
+                    if not first_speaker:
+                        fout.write(",")
+                    first_speaker = False
+                    fout.write(json.dumps(speaker))
+                    fout.write(":[")
+                    for i, sample_idx in enumerate(idxs):
+                        if i > 0:
+                            fout.write(",")
+                        fout.write(str(int(sample_idx)))
+                    fout.write("]")
+                fout.write("},")
+
+                fout.write("\"index_to_speaker\":[")
+                total_samples = 0
+                first_index = True
+                with open(index_to_speaker_tmp_path, "r", encoding="utf8") as fin:
+                    for line in fin:
+                        speaker = line.rstrip("\n")
+                        if not first_index:
+                            fout.write(",")
+                        first_index = False
+                        fout.write(json.dumps(speaker))
+                        total_samples += 1
+                fout.write("],")
+                fout.write(f"\"total_samples\":{total_samples}")
+                fout.write("}")
+        finally:
+            if os.path.exists(index_to_speaker_tmp_path):
+                os.remove(index_to_speaker_tmp_path)
 
         logger.info(
             "Exported split '%s': %d entries -> %s, %s, %s",
             split,
-            len(entries),
+            num_entries,
             manifest_path,
             sidecar_ids_path,
             sidecar_index_path,
@@ -1986,21 +2037,39 @@ class ExportPersonalizationArtifacts(BaseProcessor):
 
     def process(self):
         self._ensure_output_dir()
-        manifest = self._load_manifest()
-        if not manifest:
-            logger.warning("ExportPersonalizationArtifacts received an empty manifest; nothing to export.")
+        if not self.input_manifest_file or not os.path.exists(self.input_manifest_file):
+            logger.warning("ExportPersonalizationArtifacts input manifest not found: %s", self.input_manifest_file)
             return
 
-        by_split: Dict[str, List[dict]] = {s: [] for s in self.splits}
-        for entry in manifest:
-            split = entry.get(self.set_key)
-            if split not in by_split:
-                # Ignore entries with unknown splits
-                continue
-            by_split[split].append(entry)
+        split_manifest_paths = {
+            split: os.path.join(self.output_dir, f"manifest_{split}.json") for split in self.splits
+        }
+        split_counts = {split: 0 for split in self.splits}
+        split_handles = {
+            split: open(path, "w", encoding="utf8") for split, path in split_manifest_paths.items()
+        }
+        try:
+            for entry in self._iter_manifest_entries(self.input_manifest_file):
+                split = entry.get(self.set_key)
+                if split not in split_handles:
+                    continue
+                json.dump(entry, split_handles[split], ensure_ascii=False)
+                split_handles[split].write("\n")
+                split_counts[split] += 1
+        finally:
+            for handle in split_handles.values():
+                handle.close()
+
+        if sum(split_counts.values()) == 0:
+            logger.warning("ExportPersonalizationArtifacts found no recognized split entries; nothing to export.")
+            return
 
         for split in self.splits:
-            self._write_split_artifacts(split, by_split[split])
+            self._write_split_artifacts(
+                split=split,
+                manifest_path=split_manifest_paths[split],
+                num_entries=split_counts[split],
+            )
 
         # For compatibility with BaseProcessor, set output_manifest_file to the train manifest if it exists
         train_manifest = os.path.join(self.output_dir, "manifest_train.json")
