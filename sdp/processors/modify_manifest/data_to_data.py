@@ -15,6 +15,7 @@
 import collections
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple
 import tempfile
 import shutil
@@ -1847,6 +1848,7 @@ class ExportPersonalizationArtifacts(BaseProcessor):
         dtype: str = "int16",
         codec: str = "pcm",
         hdf5_basename: str = "speech",
+        max_workers: int = -1,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -1860,6 +1862,9 @@ class ExportPersonalizationArtifacts(BaseProcessor):
         self.dtype = dtype
         self.codec = codec.lower()
         self.hdf5_basename = hdf5_basename
+        if max_workers == -1:
+            max_workers = os.cpu_count() or 1
+        self.max_workers = max(1, int(max_workers))
 
         if self.codec != "pcm":
             raise NotImplementedError(
@@ -1867,6 +1872,30 @@ class ExportPersonalizationArtifacts(BaseProcessor):
             )
         if self.dtype not in ("int16", "float32"):
             raise ValueError("dtype must be 'int16' or 'float32'")
+
+    def _prepare_entry_for_hdf5(self, indexed_entry: Tuple[int, dict]) -> Tuple[int, str, np.ndarray, str]:
+        idx, entry = indexed_entry
+        rel_path = entry[self.audio_key]
+        audio_path = os.path.join(self.base_audio_dir, rel_path)
+        if not os.path.isfile(audio_path):
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+        key = os.path.relpath(audio_path, self.base_audio_dir).replace(os.sep, "_")
+        audio = self._audio_to_array(audio_path)
+        speaker = str(entry[self.speaker_key])
+        return idx, key, audio, speaker
+
+    def _iter_prepared_entries(self, entries: List[dict]):
+        indexed_entries = enumerate(entries)
+        if self.max_workers == 1:
+            for indexed_entry in indexed_entries:
+                yield self._prepare_entry_for_hdf5(indexed_entry)
+            return
+
+        # Parallelize I/O + resampling while keeping writes to HDF5 single-threaded.
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            for prepared in executor.map(self._prepare_entry_for_hdf5, indexed_entries):
+                yield prepared
 
     def _ensure_output_dir(self):
         os.makedirs(self.output_dir, exist_ok=True)
@@ -1923,21 +1952,12 @@ class ExportPersonalizationArtifacts(BaseProcessor):
             f.attrs["dtype"] = self.dtype
             f.attrs["codec"] = self.codec
 
-            for idx, entry in enumerate(entries):
-                rel_path = entry[self.audio_key]
-                audio_path = os.path.join(self.base_audio_dir, rel_path)
-                if not os.path.isfile(audio_path):
-                    raise FileNotFoundError(f"Audio file not found: {audio_path}")
-
-                key = os.path.relpath(audio_path, self.base_audio_dir).replace(os.sep, "_")
-                audio = self._audio_to_array(audio_path)
-
+            for idx, key, audio, speaker in self._iter_prepared_entries(entries):
                 if key in grp:
                     del grp[key]
                 ds = grp.create_dataset(key, data=audio, compression=None)
                 ds.attrs["n_samples"] = int(audio.shape[0])
 
-                speaker = str(entry[self.speaker_key])
                 speaker_ids_nested[hdf5_filename][key] = speaker
                 index_to_speaker.append(speaker)
                 speaker_to_indices.setdefault(speaker, []).append(idx)

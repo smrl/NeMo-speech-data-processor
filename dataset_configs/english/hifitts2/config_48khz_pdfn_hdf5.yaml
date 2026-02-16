@@ -55,6 +55,7 @@ val_ratio: 0.10
 speaker_key: speaker
 set_key: set
 seed: 0
+max_workers: 16
 
 ###############################################################################
 # Derived paths
@@ -96,6 +97,7 @@ processors:
     set_key: ${set_key}
 
     sample_rate: ${sample_rate}
+    max_workers: ${max_workers}
     dtype: int16
     codec: pcm
     hdf5_basename: hifitts2_speech
