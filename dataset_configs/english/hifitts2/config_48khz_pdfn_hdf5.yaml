@@ -48,9 +48,9 @@ hdf5_output_dir: ${workspace_dir}/dfn_personalization
 sample_rate: 48000
 min_duration: 3.0
 
-train_ratio: 0.75
-test_ratio: 0.15
-val_ratio: 0.10
+train_ratio: 0.85
+val_ratio: 0.1
+test_ratio: 0.05
 
 speaker_key: speaker
 set_key: set
