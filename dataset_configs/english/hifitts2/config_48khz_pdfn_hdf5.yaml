@@ -104,7 +104,9 @@ processors:
     resume_if_exists: ${resume_if_exists}
     preprocess_batch_size: ${preprocess_batch_size}
     dtype: int16
-    codec: pcm
+    codec: flac
+    codec_compression: 8
+    copy_encoded_if_compatible: true
     hdf5_basename: hifitts2_speech
 
     splits:

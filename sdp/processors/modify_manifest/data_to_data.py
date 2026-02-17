@@ -19,6 +19,7 @@ from array import array
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from typing import Dict, List, Optional, Tuple
+from tempfile import NamedTemporaryFile
 import tempfile
 import shutil
 import requests
@@ -1849,6 +1850,8 @@ class ExportPersonalizationArtifacts(BaseProcessor):
         sample_rate: int = 48000,
         dtype: str = "int16",
         codec: str = "pcm",
+        codec_compression: Optional[int] = None,
+        copy_encoded_if_compatible: bool = False,
         hdf5_basename: str = "speech",
         max_workers: int = -1,
         resume_if_exists: bool = False,
@@ -1865,6 +1868,8 @@ class ExportPersonalizationArtifacts(BaseProcessor):
         self.sample_rate = int(sample_rate)
         self.dtype = dtype
         self.codec = codec.lower()
+        self.codec_compression = codec_compression
+        self.copy_encoded_if_compatible = bool(copy_encoded_if_compatible)
         self.hdf5_basename = hdf5_basename
         self.resume_if_exists = bool(resume_if_exists)
         self.preprocess_batch_size = max(1, int(preprocess_batch_size))
@@ -1872,12 +1877,34 @@ class ExportPersonalizationArtifacts(BaseProcessor):
             max_workers = os.cpu_count() or 1
         self.max_workers = max(1, int(max_workers))
 
-        if self.codec != "pcm":
+        if self.codec not in ("pcm", "flac", "vorbis"):
             raise NotImplementedError(
-                f"Only 'pcm' codec is supported in ExportPersonalizationArtifacts, got '{self.codec}'."
+                f"Only 'pcm', 'flac', and 'vorbis' codecs are supported in ExportPersonalizationArtifacts, got '{self.codec}'."
             )
         if self.dtype not in ("int16", "float32"):
             raise ValueError("dtype must be 'int16' or 'float32'")
+        if self.codec == "vorbis" and self.dtype == "int16":
+            logger.warning("Vorbis codec stores encoded bytes; dtype=%s metadata is ignored.", self.dtype)
+
+    def _can_passthrough_encoded_audio(self, path: str) -> bool:
+        """Return True when we can copy encoded bytes without decoding/re-encoding."""
+        if not self.copy_encoded_if_compatible:
+            return False
+        if self.codec == "flac" and not path.lower().endswith(".flac"):
+            return False
+        if self.codec == "vorbis" and not (path.lower().endswith(".ogg") or path.lower().endswith(".vorbis")):
+            return False
+
+        try:
+            meta = torchaudio.info(path)
+            # Keep output behavior compatible with exporter assumptions: mono + target sample rate.
+            if int(meta.sample_rate) != self.sample_rate:
+                return False
+            if int(getattr(meta, "num_channels", 1)) != 1:
+                return False
+            return True
+        except Exception:
+            return False
 
     def _entry_to_key_and_speaker(self, entry: dict) -> Tuple[str, str, str]:
         rel_path = entry[self.audio_key]
@@ -1886,12 +1913,12 @@ class ExportPersonalizationArtifacts(BaseProcessor):
         speaker = str(entry[self.speaker_key])
         return audio_path, key, speaker
 
-    def _prepare_entry_for_hdf5(self, entry: dict) -> Tuple[str, np.ndarray, str]:
+    def _prepare_entry_for_hdf5(self, entry: dict) -> Tuple[str, np.ndarray, str, int]:
         audio_path, key, speaker = self._entry_to_key_and_speaker(entry)
         if not os.path.isfile(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
-        audio = self._audio_to_array(audio_path)
-        return key, audio, speaker
+        audio, n_samples = self._audio_to_array(audio_path)
+        return key, audio, speaker, n_samples
 
     def _iter_prepared_entries(self, entries: List[dict]):
         if self.max_workers == 1:
@@ -1922,7 +1949,13 @@ class ExportPersonalizationArtifacts(BaseProcessor):
         if batch:
             yield batch
 
-    def _audio_to_array(self, path: str) -> np.ndarray:
+    def _audio_to_array(self, path: str) -> Tuple[np.ndarray, int]:
+        if self.codec in ("flac", "vorbis") and self._can_passthrough_encoded_audio(path):
+            meta = torchaudio.info(path)
+            with open(path, "rb") as fin:
+                encoded = np.frombuffer(fin.read(), dtype=np.uint8).copy()
+            return encoded, int(meta.num_frames)
+
         # Load audio; resample to target sample_rate if needed.
         waveform, sr = torchaudio.load(path)
         if waveform.dim() == 2 and waveform.shape[0] > 1:
@@ -1934,15 +1967,49 @@ class ExportPersonalizationArtifacts(BaseProcessor):
         # (channels, samples) -> (samples,) mono
         if waveform.dim() == 2:
             waveform = waveform[0]
-        audio = waveform.numpy()
-        if self.dtype == "int16":
-            # Normalize to [-1,1] if not already, then scale
-            max_val = np.max(np.abs(audio)) or 1.0
-            audio = audio / max_val
-            audio = (audio * 32767.0).astype(np.int16)
-        else:
-            audio = audio.astype(np.float32)
-        return audio
+        n_samples = int(waveform.shape[0])
+
+        if self.codec == "pcm":
+            audio = waveform.numpy()
+            if self.dtype == "int16":
+                # Normalize to [-1,1] if not already, then scale.
+                max_val = np.max(np.abs(audio)) or 1.0
+                audio = audio / max_val
+                audio = (audio * 32767.0).astype(np.int16)
+            else:
+                audio = audio.astype(np.float32)
+            return audio, n_samples
+
+        if self.codec == "flac":
+            compression = 8 if self.codec_compression is None else int(self.codec_compression)
+            with NamedTemporaryFile(suffix=".flac") as tf:
+                torchaudio.save(
+                    tf.name,
+                    waveform.reshape(1, -1),
+                    self.sample_rate,
+                    format="flac",
+                    compression=compression,
+                    bits_per_sample=16,
+                )
+                tf.seek(0)
+                encoded = np.frombuffer(tf.read(), dtype=np.uint8).copy()
+            return encoded, n_samples
+
+        if self.codec == "vorbis":
+            compression = 8 if self.codec_compression is None else int(self.codec_compression)
+            with NamedTemporaryFile(suffix=".ogg") as tf:
+                torchaudio.save(
+                    tf.name,
+                    waveform.reshape(1, -1),
+                    self.sample_rate,
+                    format="vorbis",
+                    compression=compression,
+                )
+                tf.seek(0)
+                encoded = np.frombuffer(tf.read(), dtype=np.uint8).copy()
+            return encoded, n_samples
+
+        raise NotImplementedError(f"Codec '{self.codec}' not supported.")
 
     def _write_split_artifacts(self, split: str, manifest_path: str, num_entries: int):
         if num_entries == 0:
@@ -1998,13 +2065,13 @@ class ExportPersonalizationArtifacts(BaseProcessor):
                             if exists_in_hdf5:
                                 reused_count += 1
                             else:
-                                prepared_key, audio, prepared_speaker = next(prepared_iter)
+                                prepared_key, audio, prepared_speaker, n_samples = next(prepared_iter)
                                 if prepared_key != key:
                                     raise RuntimeError(
                                         f"Prepared key mismatch: expected {key}, got {prepared_key}"
                                     )
                                 ds = grp.create_dataset(prepared_key, data=audio, compression=None)
-                                ds.attrs["n_samples"] = int(audio.shape[0])
+                                ds.attrs["n_samples"] = n_samples
                                 speaker = prepared_speaker
                                 written_count += 1
 
