@@ -2035,7 +2035,8 @@ class ExportPersonalizationArtifacts(BaseProcessor):
                 first_pair = True
 
                 hdf5_mode = "a" if self.resume_if_exists and os.path.exists(hdf5_path) else "w"
-                with h5.File(hdf5_path, hdf5_mode) as f:
+                check_existing_keys = hdf5_mode == "a"
+                with h5.File(hdf5_path, hdf5_mode, libver="latest") as f:
                     if "speech" in f:
                         grp = f["speech"]
                     else:
@@ -2052,7 +2053,7 @@ class ExportPersonalizationArtifacts(BaseProcessor):
                         entries_to_prepare = []
                         for entry in batch:
                             _, key, speaker = self._entry_to_key_and_speaker(entry)
-                            exists_in_hdf5 = key in grp
+                            exists_in_hdf5 = (key in grp) if check_existing_keys else False
                             batch_meta.append((key, speaker, exists_in_hdf5))
                             if not exists_in_hdf5:
                                 entries_to_prepare.append(entry)
