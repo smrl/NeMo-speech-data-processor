@@ -1987,9 +1987,7 @@ class ExportPersonalizationArtifacts(BaseProcessor):
                     tf.name,
                     waveform.reshape(1, -1),
                     self.sample_rate,
-                    format="flac",
                     compression=compression,
-                    bits_per_sample=16,
                 )
                 tf.seek(0)
                 encoded = np.frombuffer(tf.read(), dtype=np.uint8).copy()
@@ -2002,7 +2000,6 @@ class ExportPersonalizationArtifacts(BaseProcessor):
                     tf.name,
                     waveform.reshape(1, -1),
                     self.sample_rate,
-                    format="vorbis",
                     compression=compression,
                 )
                 tf.seek(0)
