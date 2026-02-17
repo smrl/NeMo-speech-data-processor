@@ -1917,7 +1917,11 @@ class ExportPersonalizationArtifacts(BaseProcessor):
         audio_path, key, speaker = self._entry_to_key_and_speaker(entry)
         if not os.path.isfile(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
-        audio, n_samples = self._audio_to_array(audio_path)
+        try:
+            audio, n_samples = self._audio_to_array(audio_path)
+        except Exception as exc:
+            logger.warning("Skipping corrupted/unreadable audio file (will be excluded from HDF5): %s — %s", audio_path, exc)
+            return key, None, speaker, 0
         return key, audio, speaker, n_samples
 
     def _iter_prepared_entries(self, entries: List[dict]):
@@ -2018,6 +2022,8 @@ class ExportPersonalizationArtifacts(BaseProcessor):
         hdf5_path = os.path.join(self.output_dir, hdf5_filename)
         sidecar_ids_path = hdf5_path + ".speaker_ids.json"
         sidecar_index_path = hdf5_path + ".speaker_index.json"
+        sidecar_ids_tmp_path = sidecar_ids_path + ".tmp"
+        sidecar_index_tmp_path = sidecar_index_path + ".tmp"
         speaker_to_indices: Dict[str, array] = {}
 
         # Keep this stream on disk to avoid storing a potentially huge list of speakers in RAM.
@@ -2028,7 +2034,7 @@ class ExportPersonalizationArtifacts(BaseProcessor):
         tmp_idx_to_speaker = open(index_to_speaker_tmp_path, "w", encoding="utf8")
 
         try:
-            with open(sidecar_ids_path, "w", encoding="utf8") as ids_out:
+            with open(sidecar_ids_tmp_path, "w", encoding="utf8") as ids_out:
                 ids_out.write("{")
                 ids_out.write(json.dumps(hdf5_filename))
                 ids_out.write(":{")
@@ -2068,6 +2074,9 @@ class ExportPersonalizationArtifacts(BaseProcessor):
                                     raise RuntimeError(
                                         f"Prepared key mismatch: expected {key}, got {prepared_key}"
                                     )
+                                if audio is None:
+                                    # Audio file was corrupted/unreadable; skip it entirely.
+                                    continue
                                 ds = grp.create_dataset(prepared_key, data=audio, compression=None)
                                 ds.attrs["n_samples"] = n_samples
                                 speaker = prepared_speaker
@@ -2087,7 +2096,7 @@ class ExportPersonalizationArtifacts(BaseProcessor):
 
                 ids_out.write("}}")
 
-            with open(sidecar_index_path, "w", encoding="utf8") as fout:
+            with open(sidecar_index_tmp_path, "w", encoding="utf8") as fout:
                 fout.write("{")
                 fout.write("\"speaker_to_indices\":{")
                 first_speaker = True
@@ -2118,10 +2127,17 @@ class ExportPersonalizationArtifacts(BaseProcessor):
                 fout.write("],")
                 fout.write(f"\"total_samples\":{total_samples}")
                 fout.write("}")
+            # Atomic swap so interrupted runs never leave truncated sidecars.
+            os.replace(sidecar_ids_tmp_path, sidecar_ids_path)
+            os.replace(sidecar_index_tmp_path, sidecar_index_path)
         finally:
             tmp_idx_to_speaker.close()
             if os.path.exists(index_to_speaker_tmp_path):
                 os.remove(index_to_speaker_tmp_path)
+            if os.path.exists(sidecar_ids_tmp_path):
+                os.remove(sidecar_ids_tmp_path)
+            if os.path.exists(sidecar_index_tmp_path):
+                os.remove(sidecar_index_tmp_path)
 
         logger.info(
             "Exported split '%s': %d entries (written=%d, reused=%d, resume=%s) -> %s, %s, %s",
