@@ -17,15 +17,21 @@ from array import array
 import h5py as h5
 
 
-def _key_from_entry(entry: dict, audio_key: str, base_audio_dir: str) -> str:
-    rel_path = entry[audio_key]
-    audio_path = os.path.join(base_audio_dir, rel_path)
-    return os.path.relpath(audio_path, base_audio_dir).replace(os.sep, "_")
+def _key_from_entry(entry: dict, audio_key: str, base_audio_dir: str = None) -> str:
+    """Derive HDF5 dataset key from manifest entry (same rule as ExportPersonalizationArtifacts)."""
+    path_in_manifest = entry[audio_key]
+    if base_audio_dir is not None:
+        audio_path = os.path.join(base_audio_dir, path_in_manifest)
+        rel_path = os.path.relpath(audio_path, base_audio_dir)
+    else:
+        # Manifest already has paths relative to the same root used when building the HDF5.
+        rel_path = os.path.normpath(path_in_manifest).lstrip(os.sep)
+    return rel_path.replace(os.sep, "_")
 
 
 def _build_key_to_speaker(
     manifest_path: str,
-    base_audio_dir: str,
+    base_audio_dir: str = None,
     split: str = None,
     set_key: str = "set",
     speaker_key: str = "speaker",
@@ -48,7 +54,7 @@ def _build_key_to_speaker(
 def rebuild_sidecars(
     manifest_path: str,
     hdf5_path: str,
-    base_audio_dir: str,
+    base_audio_dir: str = None,
     split: str = None,
     set_key: str = "set",
     speaker_key: str = "speaker",
@@ -166,7 +172,11 @@ def main():
     parser = argparse.ArgumentParser(description="Rebuild speaker sidecars from manifest + HDF5 keys.")
     parser.add_argument("--manifest", required=True, help="Path to manifest JSONL (split manifest or per-split manifest).")
     parser.add_argument("--hdf5", required=True, help="Target HDF5 file path.")
-    parser.add_argument("--base-audio-dir", required=True, help="Base audio directory used to derive HDF5 keys.")
+    parser.add_argument(
+        "--base-audio-dir",
+        default=None,
+        help="Base audio directory used to derive HDF5 keys. Optional if manifest audio paths are already relative to the same root used when building the HDF5.",
+    )
     parser.add_argument("--split", default=None, help="Optional split to filter by (e.g., train/test/val).")
     parser.add_argument("--set-key", default="set", help="Manifest split field name.")
     parser.add_argument("--speaker-key", default="speaker", help="Manifest speaker field name.")
