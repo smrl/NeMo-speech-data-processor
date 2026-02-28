@@ -12,26 +12,28 @@ This script does NOT modify HDF5 audio content.
 import argparse
 import json
 import os
+import sys
 from array import array
 
 import h5py as h5
 
 
-def _key_from_entry(entry: dict, audio_key: str, base_audio_dir: str = None) -> str:
-    """Derive HDF5 dataset key from manifest entry (same rule as ExportPersonalizationArtifacts)."""
-    path_in_manifest = entry[audio_key]
-    if base_audio_dir is not None:
-        audio_path = os.path.join(base_audio_dir, path_in_manifest)
-        rel_path = os.path.relpath(audio_path, base_audio_dir)
-    else:
-        # Manifest already has paths relative to the same root used when building the HDF5.
-        rel_path = os.path.normpath(path_in_manifest).lstrip(os.sep)
-    return rel_path.replace(os.sep, "_")
+def _key_from_entry(entry: dict, audio_key: str, base_audio_dir: str) -> str:
+    """Derive HDF5 dataset key from manifest entry.
+
+    Must match ExportPersonalizationArtifacts._entry_to_key_and_speaker in
+    sdp/processors/modify_manifest/data_to_data.py exactly, so that keys
+    built from manifest_val.json match the keys written into the HDF5.
+    """
+    rel_path = entry[audio_key]
+    audio_path = os.path.join(base_audio_dir, rel_path)
+    key = os.path.relpath(audio_path, base_audio_dir).replace(os.sep, "_")
+    return key
 
 
 def _build_key_to_speaker(
     manifest_path: str,
-    base_audio_dir: str = None,
+    base_audio_dir: str,
     split: str = None,
     set_key: str = "set",
     speaker_key: str = "speaker",
@@ -51,10 +53,30 @@ def _build_key_to_speaker(
     return key_to_speaker
 
 
+def _manifest_entries_in_order(
+    manifest_path: str,
+    base_audio_dir: str,
+    split: str = None,
+    set_key: str = "set",
+    speaker_key: str = "speaker",
+    audio_key: str = "audio_filepath",
+):
+    """Yield (key, speaker) in manifest order (for order-based matching)."""
+    with open(manifest_path, "r", encoding="utf8") as fin:
+        for line in fin:
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            if split is not None and entry.get(set_key) != split:
+                continue
+            key = _key_from_entry(entry, audio_key=audio_key, base_audio_dir=base_audio_dir)
+            yield key, str(entry[speaker_key])
+
+
 def rebuild_sidecars(
     manifest_path: str,
     hdf5_path: str,
-    base_audio_dir: str = None,
+    base_audio_dir: str,
     split: str = None,
     set_key: str = "set",
     speaker_key: str = "speaker",
@@ -89,9 +111,31 @@ def rebuild_sidecars(
             raise KeyError(f"HDF5 group '{hdf5_group}' not found in {hdf5_path}")
         grp = f[hdf5_group]
 
-        # Iterate HDF5 keys in their natural order so indices match HDF5 iteration.
-        for idx, key in enumerate(grp.keys()):
+        for key in grp.keys():
             hdf5_keys_ordered.append(key)
+
+    keys_in_hdf5 = len(hdf5_keys_ordered)
+
+    # Order-based matching: HDF5 uses numeric string keys "0","1",... (e.g. from another pipeline).
+    if keys_in_hdf5 > 0 and all(k.isdigit() for k in hdf5_keys_ordered):
+        manifest_ordered = list(_manifest_entries_in_order(
+            manifest_path, base_audio_dir, split=split, set_key=set_key,
+            speaker_key=speaker_key, audio_key=audio_key,
+        ))
+        if len(manifest_ordered) != keys_in_hdf5:
+            raise ValueError(
+                f"Order-based matching: manifest has {len(manifest_ordered)} entries for this split "
+                f"but HDF5 has {keys_in_hdf5} keys. Counts must match."
+            )
+        index_to_speaker_list = [speaker for _, speaker in manifest_ordered]
+        key_to_speaker = {hdf5_keys_ordered[i]: manifest_ordered[i][1] for i in range(keys_in_hdf5)}
+        speaker_to_indices = {}
+        for idx, (_, speaker) in enumerate(manifest_ordered):
+            speaker_to_indices.setdefault(speaker, array("I")).append(idx)
+        keys_missing_speaker = 0
+    else:
+        # Path-based matching: key from manifest (same formula as ExportPersonalizationArtifacts).
+        for idx, key in enumerate(hdf5_keys_ordered):
             speaker = key_to_speaker.get(key)
             if speaker is None:
                 keys_missing_speaker += 1
@@ -100,7 +144,22 @@ def rebuild_sidecars(
                 speaker_to_indices.setdefault(speaker, array("I")).append(idx)
 
     total_samples = len(index_to_speaker_list)
-    keys_in_hdf5 = len(hdf5_keys_ordered)
+
+    # When no keys matched, help the user debug path format mismatch
+    if keys_missing_speaker == keys_in_hdf5 and keys_in_hdf5 > 0:
+        manifest_sample = list(key_to_speaker.keys())[:3] if key_to_speaker else []
+        hdf5_sample = hdf5_keys_ordered[:3]
+        print(
+            "WARNING: No manifest entries matched any HDF5 key (speaker_count=0).\n"
+            "Keys are derived the same way as ExportPersonalizationArtifacts (data_to_data.py).\n"
+            "Sample keys from manifest (first 3):",
+            manifest_sample or "(none)",
+            "\nSample keys from HDF5 (first 3):",
+            hdf5_sample,
+            "\nPass the same --base-audio-dir that was used when the HDF5 was created\n"
+            "(e.g. audio_source_dir / base_audio_dir from the export config).",
+            file=sys.stderr,
+        )
 
     try:
         with open(sidecar_ids_tmp, "w", encoding="utf8") as ids_out:
@@ -108,8 +167,8 @@ def rebuild_sidecars(
             ids_out.write(json.dumps(hdf5_filename))
             ids_out.write(":{")
             first_pair = True
-            for key in hdf5_keys_ordered:
-                speaker = key_to_speaker.get(key)
+            for i, key in enumerate(hdf5_keys_ordered):
+                speaker = index_to_speaker_list[i] if i < len(index_to_speaker_list) else None
                 if not first_pair:
                     ids_out.write(",")
                 first_pair = False
@@ -174,8 +233,8 @@ def main():
     parser.add_argument("--hdf5", required=True, help="Target HDF5 file path.")
     parser.add_argument(
         "--base-audio-dir",
-        default=None,
-        help="Base audio directory used to derive HDF5 keys. Optional if manifest audio paths are already relative to the same root used when building the HDF5.",
+        required=True,
+        help="Base audio directory; must be the same as base_audio_dir / audio_source_dir used when ExportPersonalizationArtifacts created the HDF5 (see data_to_data.py).",
     )
     parser.add_argument("--split", default=None, help="Optional split to filter by (e.g., train/test/val).")
     parser.add_argument("--set-key", default="set", help="Manifest split field name.")
